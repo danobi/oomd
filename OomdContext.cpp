@@ -17,21 +17,36 @@
 
 #include "oomd/OomdContext.h"
 #include "oomd/Log.h"
+#include "oomd/include/Assert.h"
 #include "oomd/util/Fs.h"
 
 #include <exception>
 
 namespace Oomd {
 
+CgroupNode::CgroupNode(CgroupPath p) : path(std::move(p)) {}
+
+CgroupNode::~CgroupNode() {
+  for (CgroupNode* child : children) {
+    delete child;
+  }
+
+  // NB: don't delete the parent! It'll be a circular destruction.
+}
+
+OomdContext::~OomdContext() {
+  if (root_) {
+    delete root_;
+  }
+}
+
 OomdContext& OomdContext::operator=(OomdContext&& other) {
-  memory_state_ = std::move(other.memory_state_);
-  action_context_ = other.action_context_;
+  moveFrom(std::move(other));
   return *this;
 }
 
 OomdContext::OomdContext(OomdContext&& other) noexcept {
-  memory_state_ = std::move(other.memory_state_);
-  action_context_ = other.action_context_;
+  moveFrom(std::move(other));
 }
 
 bool OomdContext::hasCgroupContext(const CgroupPath& path) const {
@@ -48,18 +63,27 @@ std::vector<CgroupPath> OomdContext::cgroups() const {
   return keys;
 }
 
-const CgroupContext& OomdContext::getCgroupContext(const CgroupPath& path) {
+const CgroupContext& OomdContext::getCgroupContext(
+    const CgroupPath& path) const {
   if (!hasCgroupContext(path)) {
     throw std::invalid_argument("Cgroup not present");
   }
 
-  return memory_state_[path];
+  return memory_state_.at(path)->ctx;
+}
+
+const CgroupNode* OomdContext::getCgroupNode(const CgroupPath& path) const {
+  if (!hasCgroupContext(path)) {
+    return nullptr;
+  }
+
+  return memory_state_.at(path);
 }
 
 void OomdContext::setCgroupContext(
     const CgroupPath& path,
     CgroupContext context) {
-  memory_state_[path] = context;
+  memory_state_[path] = addToTree(path, context);
 }
 
 std::vector<std::pair<CgroupPath, CgroupContext>> OomdContext::reverseSort(
@@ -68,7 +92,7 @@ std::vector<std::pair<CgroupPath, CgroupContext>> OomdContext::reverseSort(
 
   for (const auto& pair : memory_state_) {
     vec.emplace_back(
-        std::pair<CgroupPath, CgroupContext>{pair.first, pair.second});
+        std::pair<CgroupPath, CgroupContext>{pair.first, pair.second->ctx});
   }
 
   if (getKey) {
@@ -141,6 +165,82 @@ void OomdContext::dumpOomdContext(
          << " mem_low=" << (ms.second.memory_low >> 20) << "MB"
          << " swap=" << (ms.second.swap_usage >> 20) << "MB";
   }
+}
+
+void OomdContext::moveFrom(OomdContext&& other) {
+  root_ = other.root_;
+  other.root_ = nullptr;
+  memory_state_ = std::move(other.memory_state_);
+  action_context_ = other.action_context_;
+}
+
+CgroupNode* OomdContext::addToTree(CgroupPath path, CgroupContext ctx) {
+  CgroupNode* node = findInTree(path);
+  if (node) {
+    node->ctx = std::move(ctx);
+    node->isEmptyBranch = false;
+    return node;
+  }
+
+  // Didn't find the node; add it
+  return addToTreeHelper(std::move(path), std::move(ctx));
+}
+
+CgroupNode* OomdContext::addToTreeHelper(CgroupPath path, CgroupContext ctx) {
+  // Base case: we're trying to add the root
+  if (path.isRoot()) {
+    if (!root_) {
+      root_ = new CgroupNode(std::move(path));
+    } else {
+      // Only one cgroup root is allowed
+      OCHECK_EXCEPT(
+          path == root_->path,
+          std::invalid_argument("Multiple cgroup FS detected"));
+    }
+
+    return root_;
+  }
+
+  // First find our parent
+  CgroupPath p(path);
+  p.ascend();
+  CgroupNode* parent = findInTree(p);
+
+  // Create our parent if we need to
+  if (!parent) {
+    parent = addToTreeHelper(p, CgroupContext{});
+    parent->isEmptyBranch = true;
+  }
+
+  // Now add ourselves as a child
+  CgroupNode* us = new CgroupNode(path);
+  us->ctx = std::move(ctx);
+  us->parent = parent;
+  parent->children.emplace_back(us);
+  return us;
+}
+
+CgroupNode* OomdContext::findInTree(const CgroupPath& path) const {
+  if (path.isRoot()) {
+    return root_;
+  }
+
+  // Find parent
+  CgroupPath p(path);
+  p.ascend();
+  CgroupNode* parent = findInTree(p);
+  if (!parent) {
+    return nullptr;
+  }
+
+  // See if we match any of the parent's children
+  for (CgroupNode* n : parent->children) {
+    if (n->path == path) {
+      return n;
+    }
+  }
+
+  return nullptr;
 }
 
 } // namespace Oomd

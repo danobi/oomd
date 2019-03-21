@@ -34,10 +34,22 @@ struct ActionContext {
   std::string detectorgroup;
 };
 
+struct CgroupNode {
+  CgroupNode(CgroupPath p);
+  ~CgroupNode();
+
+  CgroupPath path;
+  CgroupContext ctx;
+  // Is this node holding actual data or are we simply a branch for a leaf
+  bool isEmptyBranch{false};
+  CgroupNode* parent{nullptr};
+  std::vector<CgroupNode*> children;
+};
+
 class OomdContext {
  public:
-  OomdContext() {} // = default warns about dynamic exceptions
-  ~OomdContext() = default;
+  OomdContext() = default;
+  ~OomdContext();
   OomdContext(OomdContext&& other) noexcept;
   OomdContext& operator=(OomdContext&& other);
 
@@ -55,7 +67,12 @@ class OomdContext {
    * @returns a CgroupContext reference associated with @param name
    * @throws std::invalid_argument for missing cgroup
    */
-  const CgroupContext& getCgroupContext(const CgroupPath& path);
+  const CgroupContext& getCgroupContext(const CgroupPath& path) const;
+
+  /**
+   * @returns a CgroupNode* if cgroup is present, nullptr otherwise
+   */
+  const CgroupNode* getCgroupNode(const CgroupPath& path) const;
 
   /**
    * Assigns a mapping of cgroup -> CgroupContext
@@ -94,7 +111,14 @@ class OomdContext {
   void setActionContext(ActionContext context);
 
  private:
-  std::unordered_map<CgroupPath, CgroupContext> memory_state_;
+  void moveFrom(OomdContext&& other);
+  CgroupNode* addToTree(CgroupPath path, CgroupContext ctx);
+  CgroupNode* addToTreeHelper(CgroupPath path, CgroupContext ctx);
+  CgroupNode* findInTree(const CgroupPath& path) const;
+
+  CgroupNode* root_{nullptr};
+  // Read cache so we don't have to walk the tree for read ops
+  std::unordered_map<CgroupPath, CgroupNode*> memory_state_;
   ActionContext action_context_;
 };
 
